@@ -1,6 +1,9 @@
 #pragma once
 
 #include <boost/noncopyable.hpp>
+#ifdef USE_MKL
+#include <mkl.h>
+#endif
 
 #include "nnpack.h"
 
