@@ -3,6 +3,9 @@
 #include "caffe/caffe.hpp"
 #include "ristretto/quantization.hpp"
 
+#include "hdf5.h"
+#include "hdf5_hl.h"
+
 using caffe::Caffe;
 using caffe::Net;
 using caffe::string;
@@ -10,6 +13,75 @@ using caffe::vector;
 using caffe::Blob;
 using caffe::LayerParameter;
 using caffe::NetParameter;
+
+template <typename Dtype>
+struct Range {
+  Dtype min;
+  Dtype max;
+};
+
+template <typename Dtype>
+struct LayerRanges {
+  string name;
+  Range<Dtype> input;
+  Range<Dtype> output;
+  Range<Dtype> params;
+};
+
+#define CHECK_H5_ERR(x) status = x; CHECK_GE(status, 0) << #x ;
+#define CHECK_H5_SUCCESS(x) status = x; CHECK_GE(status, 1) << #x ;
+
+herr_t H5ReadLayerRanges(hid_t loc_id, const char *name, void *opdata)
+{
+  LayerRanges<float> ranges;
+
+  hid_t layer_id = H5Gopen1(loc_id, name);
+  ranges.name = name;
+  LOG(INFO) << "Loading layer ranges for layer: " << name;
+
+  herr_t status;
+  static const char* names[] = {"input", "output", "params"};
+  Range<float> * pRanges[] = {&ranges.input, &ranges.output, &ranges.params};
+  for (int i = 0; i < 3; ++i)
+  {
+    hid_t group_id = H5Gopen1(layer_id, names[i]);
+    CHECK_GE(group_id, 0);
+    CHECK_H5_ERR(H5LTread_dataset_float(group_id, "min", &pRanges[i]->min));
+    CHECK_H5_ERR(H5LTread_dataset_float(group_id, "max", &pRanges[i]->max));
+  }
+
+  vector< LayerRanges<float> > * layer_ranges = static_cast<vector< LayerRanges<float> >* >(opdata);
+  layer_ranges->push_back(ranges);
+
+  return 0;
+}
+
+template <typename Dtype>
+void HDF5RangeInLayers(
+        const char * filename,
+        vector<string>* layer_name,
+        vector<Dtype>* max_in,
+        vector<Dtype>* max_out,
+        vector<Dtype>* max_param){
+  LOG(INFO) << "Loading HDF5 file: " << filename;
+  hid_t file_id = H5Fopen(filename, H5F_ACC_RDONLY, H5P_DEFAULT);
+  if (file_id < 0) {
+    LOG(FATAL) << "Failed opening HDF5 file: " << filename;
+  }
+
+  vector< LayerRanges<float> > layer_ranges;
+  H5Giterate(file_id, "/", NULL, H5ReadLayerRanges, &layer_ranges);
+
+  for (int i = 0; i < layer_ranges.size(); ++i) {
+    layer_name->push_back(layer_ranges[i].name);
+    max_in->push_back(layer_ranges[i].input.max);
+    max_out->push_back(layer_ranges[i].output.max);
+    max_param->push_back(layer_ranges[i].params.max);
+  }
+
+  herr_t status = H5Fclose(file_id);
+  CHECK_GE(status, 0) << "Failed to close HDF5 file: " << filename;
+}
 
 Quantization::Quantization(string model, string weights, string model_quantized,
       int iterations, string trimming_mode, double error_margin, string gpus) {
@@ -25,6 +97,25 @@ Quantization::Quantization(string model, string weights, string model_quantized,
   // 4bits, but the saturation border is at 3bits (when assuming infinitely long
   // mantisssa).
   this->exp_bits_ = 4;
+}
+
+void Quantization::GenerateNet() {
+  CheckWritePermissions(model_quantized_);
+  SetGpu();
+  // Do network quantization and scoring.
+  if (trimming_mode_ == "dynamic_fixed_point") {
+    GenerateDynamicFixedPoint(
+        "ranges.h5", 16,
+        "Convolution_and_InnerProduct", "Parameters_and_Activations");
+  } else if (trimming_mode_ == "minifloat") {
+    LOG(FATAL) << "Trimming mode not supported for generation: " << trimming_mode_;
+    //Quantize2MiniFloat();
+  } else if (trimming_mode_ == "integer_power_of_2_weights") {
+    LOG(FATAL) << "Trimming mode not supported for generation: " << trimming_mode_;
+    //Quantize2IntegerPowerOf2Weights();
+  } else {
+    LOG(FATAL) << "Unknown trimming mode. Trimming mode not supported for generation: " << trimming_mode_;
+  }
 }
 
 void Quantization::QuantizeNet() {
@@ -152,6 +243,38 @@ void Quantization::RunForwardBatches(const int iterations,
     LOG(INFO) << output_name << " = " << mean_score << loss_msg_stream.str();
   }
   *accuracy = test_score[score_number] / iterations;
+}
+
+void Quantization::GenerateDynamicFixedPoint(
+    const string ranges_fname, const int bitwidth,
+    const string layers_2_quantize, const string net_part) {
+  // Find the integer length for dynamic fixed point numbers
+  vector<float> max_in, max_out, max_params;
+  HDF5RangeInLayers(ranges_fname.c_str(), &layer_names_, &max_in, &max_out, &max_params);
+  // The integer length is chosen such that no saturation occurs.
+  // This approximation assumes an infinitely long factional part.
+  // For layer activations, we reduce the integer length by one bit.
+  for (int i = 0; i < layer_names_.size(); ++i) {
+    il_in_.push_back((int)ceil(log2(max_in[i])));
+    il_out_.push_back((int)ceil(log2(max_out[i])));
+    il_params_.push_back((int)ceil(log2(max_params[i])+1));
+  }
+  // Debug
+  for (int k = 0; k < layer_names_.size(); ++k) {
+    LOG(INFO) << "Layer " << layer_names_[k] <<
+        ", integer length input=" << il_in_[k] <<
+        ", integer length output=" << il_out_[k] <<
+        ", integer length parameters=" << il_params_[k];
+  }
+
+  // Generate and write out
+  NetParameter param;
+  caffe::ReadNetParamsFromTextFileOrDie(model_, &param);
+  EditNetDescriptionDynamicFixedPoint(&param, layers_2_quantize, net_part, bitwidth, bitwidth, bitwidth, bitwidth);
+  //net_test = new Net<float>(param, NULL);
+  WriteProtoToTextFile(param, model_quantized_);
+  //delete net_test;
+  param.release_state();
 }
 
 void Quantization::Quantize2DynamicFixedPoint() {

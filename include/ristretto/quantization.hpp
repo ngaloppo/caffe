@@ -18,6 +18,7 @@ public:
   explicit Quantization(string model, string weights, string model_quantized,
       int iterations, string trimming_mode, double error_margin, string gpus);
   void QuantizeNet();
+  void GenerateNet();
 private:
   void CheckWritePermissions(const string path);
   void SetGpu();
@@ -62,6 +63,14 @@ private:
    * The quantized layers don't need any multipliers in hardware.
    */
   void Quantize2IntegerPowerOf2Weights();
+
+  /**
+   * @brief Generate network with fixed point and given bitwidth
+   */
+  void GenerateDynamicFixedPoint(
+      const string ranges_fname, const int bitwidth,
+      const string layers_2_quantize,
+      const string network_part);
   /**
    * @brief Change network to dynamic fixed point.
    */

@@ -91,6 +91,20 @@ int quantize(){
 }
 RegisterBrewFunction(quantize);
 
+int generate(){
+  CHECK_GT(FLAGS_model.size(), 0) << "Need a model definition to score.";
+  CHECK_GT(FLAGS_model_quantized.size(), 0) << "Need network description "
+      "output path.";
+  CHECK_GT(FLAGS_trimming_mode.size(), 0) << "Need trimming mode.";
+  Quantization* q = new Quantization(FLAGS_model, "no_file.caffemodel",
+      FLAGS_model_quantized, FLAGS_iterations, FLAGS_trimming_mode,
+      FLAGS_error_margin, FLAGS_gpu);
+  q->GenerateNet();
+  delete q;
+  return 0;
+}
+RegisterBrewFunction(generate);
+
 int main(int argc, char** argv) {
   // Print output to stderr (while still logging).
   FLAGS_alsologtostderr = 1;
@@ -100,7 +114,8 @@ int main(int argc, char** argv) {
   gflags::SetUsageMessage("command line brew\n"
       "usage: ristretto <command> <args>\n\n"
       "commands:\n"
-      "  quantize        Trim 32bit floating point net\n");
+      "  quantize        Trim 32bit floating point net\n"
+      "  generate        Generate quantized net\n");
   // Run tool or show usage.
   caffe::GlobalInit(&argc, &argv);
   if (argc == 2) {
